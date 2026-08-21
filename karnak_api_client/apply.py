@@ -351,10 +351,25 @@ def _ensure_destinations(
         existing = existing_by_key.get(key)
         if existing:
             destination_id = int(existing["id"])
-            merged = dict(existing)
-            merged.update(body)
-            client.update_destination(forward_node_id, destination_id, merged)
-            summary.append({"id": destination_id, "key": list(key), "created": False})
+            if _matches(existing, body):
+                # Nothing to change. Skipping the write is not just an
+                # optimisation: Karnak's PUT on an existing destination
+                # DESTROYS it (returns 200, then the destination is gone from
+                # the forward node), so re-applying an unchanged config would
+                # silently leave the gateway with nowhere to deliver.
+                summary.append(
+                    {"id": destination_id, "key": list(key), "created": False, "unchanged": True}
+                )
+                continue
+            # A real change. PUT is unusable (see above), so replace: the
+            # destination id changes and its transfer history goes with it,
+            # which is the lesser evil against a node left with no destination.
+            client.delete_destination(forward_node_id, destination_id)
+            created = client.add_destination(forward_node_id, body)
+            destination_id = int(created.get("id", 0)) if isinstance(created, dict) else 0
+            summary.append(
+                {"id": destination_id, "key": list(key), "created": True, "replaced": True}
+            )
         else:
             created = client.add_destination(forward_node_id, body)
             destination_id = int(created.get("id", 0)) if isinstance(created, dict) else 0
@@ -365,6 +380,26 @@ def _ensure_destinations(
             _deactivate_unrequested(client, forward_node_id, existing_by_key, requested_keys)
         )
     return summary
+
+
+
+def _matches(existing: dict[str, Any], desired: dict[str, Any]) -> bool:
+    """True when every field the desired config sets already has that value.
+
+    Only the keys we manage are compared — Karnak decorates a destination with
+    server-side fields (ids, timestamps, association state) that must not count
+    as drift, or every apply would look like a change and trigger a replace.
+    """
+    for field, want in desired.items():
+        if field in ("deIdentificationProject", "tagMorphingProject"):
+            # Compare by id; the server echoes a fully expanded project object.
+            have = existing.get(field) or {}
+            if not isinstance(have, dict) or have.get("id") != (want or {}).get("id"):
+                return False
+            continue
+        if existing.get(field) != want:
+            return False
+    return True
 
 
 def _deactivate_unrequested(

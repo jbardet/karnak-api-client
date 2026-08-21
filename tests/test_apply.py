@@ -15,6 +15,8 @@ from karnak_api_client import apply_config
 class FakeKarnakClient:
     def __init__(self, destinations: list[dict[str, Any]] | None = None) -> None:
         self.updated_destinations: list[dict[str, Any]] = []
+        self.added_destinations: list[dict[str, Any]] = []
+        self.deleted_destinations: list[int] = []
         self.uploaded_profiles: list[Path] = []
         self.destinations: list[dict[str, Any]] = (
             destinations
@@ -75,7 +77,11 @@ class FakeKarnakClient:
         return {"id": destination_id, **body}
 
     def add_destination(self, _forward_node_id: int, body: dict[str, Any]) -> dict[str, Any]:
+        self.added_destinations.append(body)
         return {"id": 66, **body}
+
+    def delete_destination(self, _forward_node_id: int, destination_id: int) -> None:
+        self.deleted_destinations.append(destination_id)
 
 
 def test_apply_config_reuses_existing_resources_and_links_destination(tmp_path: Path) -> None:
@@ -107,7 +113,10 @@ def test_apply_config_reuses_existing_resources_and_links_destination(tmp_path: 
     assert summary["project"]["created"] is False
     assert summary["project"]["secret_created"] is False
     assert client.uploaded_profiles == []
-    assert client.updated_destinations[0]["deIdentificationProject"] == {"id": 4}
+    # The stub destination lacks hostname/port, so this is a real change and
+    # takes the delete+add path — PUT is never used (it deletes server-side).
+    assert client.added_destinations[0]["deIdentificationProject"] == {"id": 4}
+    assert client.updated_destinations == []
 
 
 def _stow_only_config(profile: Path) -> dict[str, Any]:
@@ -200,3 +209,81 @@ def test_apply_config_leaves_already_inactive_destinations_alone(tmp_path: Path)
 
     assert not any(d.get("deactivated") for d in summary["destinations"])
     assert all(d["id"] != 6 for d in client.updated_destinations)
+
+
+def _local_receiver_config(profile: Path) -> dict[str, Any]:
+    return {
+        "profile": {"path": str(profile), "name": "Profile A", "version": "1.0"},
+        "project": {"name": "Project A", "ensureSecret": True},
+        "forwardNode": {"aeTitle": "KARNAK-GATEWAY"},
+        "sourceNodes": [],
+        "destinations": [
+            {
+                "destinationType": "dicom",
+                "aeTitle": "LOCAL-STORAGE",
+                "hostname": "dicom_receiver",
+                "port": 11104,
+                "activate": True,
+                "desidentification": True,
+            }
+        ],
+    }
+
+
+def test_reapplying_an_unchanged_destination_writes_nothing(tmp_path: Path) -> None:
+    """Karnak's PUT on an existing destination deletes it (200, then gone).
+
+    Re-provisioning with an unchanged config must therefore be a pure no-op, or
+    the gateway silently ends up with nowhere to deliver.
+    """
+    profile = tmp_path / "profile.yml"
+    profile.write_text("name: Profile A\nversion: '1.0'\n", encoding="utf-8")
+    client = FakeKarnakClient(
+        destinations=[
+            {
+                "id": 6,
+                "destinationType": "dicom",
+                "aeTitle": "LOCAL-STORAGE",
+                "hostname": "dicom_receiver",
+                "port": 11104,
+                "activate": True,
+                "desidentification": True,
+                "deIdentificationProject": {"id": 4, "name": "Project A"},
+                "createdAt": "2026-08-21T10:00:00Z",
+            }
+        ]
+    )
+
+    summary = apply_config(client, _local_receiver_config(profile))  # type: ignore[arg-type]
+
+    assert client.updated_destinations == []
+    assert client.deleted_destinations == []
+    assert client.added_destinations == []
+    assert summary["destinations"][0]["unchanged"] is True
+
+
+def test_a_changed_destination_is_replaced_not_put(tmp_path: Path) -> None:
+    """A real change deletes and re-adds, because PUT cannot be used at all."""
+    profile = tmp_path / "profile.yml"
+    profile.write_text("name: Profile A\nversion: '1.0'\n", encoding="utf-8")
+    client = FakeKarnakClient(
+        destinations=[
+            {
+                "id": 6,
+                "destinationType": "dicom",
+                "aeTitle": "LOCAL-STORAGE",
+                "hostname": "OLD-HOST",
+                "port": 11104,
+                "activate": True,
+                "desidentification": True,
+                "deIdentificationProject": {"id": 4},
+            }
+        ]
+    )
+
+    summary = apply_config(client, _local_receiver_config(profile))  # type: ignore[arg-type]
+
+    assert client.updated_destinations == []
+    assert client.deleted_destinations == [6]
+    assert client.added_destinations[0]["hostname"] == "dicom_receiver"
+    assert summary["destinations"][0]["replaced"] is True
