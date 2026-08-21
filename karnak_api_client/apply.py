@@ -310,12 +310,30 @@ def _ensure_destinations(
     project_id: int,
     config: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    """Converge a forward node's destinations onto ``config["destinations"]``.
+
+    Upserts every requested destination, then — unless ``reconcileDestinations``
+    is set to false — **deactivates** every still-active destination on the node
+    that the config did not ask for.
+
+    That last step is not cosmetic. Without it the apply is additive-only: a
+    forward node configured once for a local DICOM receiver and later for a
+    Shanoir STOW endpoint keeps *both*, and every subsequent study fans out to
+    both destinations. For a de-identification gateway that is a silent
+    duplication of patient data to an endpoint nobody asked for, so the safe
+    default is to reconcile.
+
+    Unwanted destinations are deactivated (``activate: False``) rather than
+    deleted, so Karnak keeps the transfer history attached to them.
+    """
     requested = _require_list(config, "destinations")
+    reconcile = bool(config.get("reconcileDestinations", True))
     existing_by_key = {
         _destination_key(item): item
         for item in client.list_destinations(forward_node_id)
         if isinstance(item, dict)
     }
+    requested_keys: set[tuple[str, str]] = set()
     summary: list[dict[str, Any]] = []
     for raw_body in requested:
         if not isinstance(raw_body, dict):
@@ -329,6 +347,7 @@ def _ensure_destinations(
         key = _destination_key(body)
         if not key[1]:
             raise KarnakConfigError("destinations require aeTitle for DICOM or url for STOW-RS")
+        requested_keys.add(key)
         existing = existing_by_key.get(key)
         if existing:
             destination_id = int(existing["id"])
@@ -340,6 +359,36 @@ def _ensure_destinations(
             created = client.add_destination(forward_node_id, body)
             destination_id = int(created.get("id", 0)) if isinstance(created, dict) else 0
             summary.append({"id": destination_id, "key": list(key), "created": True})
+
+    if reconcile:
+        summary.extend(
+            _deactivate_unrequested(client, forward_node_id, existing_by_key, requested_keys)
+        )
+    return summary
+
+
+def _deactivate_unrequested(
+    client: KarnakClient,
+    forward_node_id: int,
+    existing_by_key: dict[tuple[str, str], dict[str, Any]],
+    requested_keys: set[tuple[str, str]],
+) -> list[dict[str, Any]]:
+    """Set ``activate: False`` on destinations the config did not request."""
+    summary: list[dict[str, Any]] = []
+    for key, existing in existing_by_key.items():
+        if key in requested_keys:
+            continue
+        # Already inactive: nothing to converge, and skipping the PUT keeps
+        # repeated applies free of pointless writes.
+        if not existing.get("activate", True):
+            continue
+        destination_id = int(existing["id"])
+        merged = dict(existing)
+        merged["activate"] = False
+        client.update_destination(forward_node_id, destination_id, merged)
+        summary.append(
+            {"id": destination_id, "key": list(key), "created": False, "deactivated": True}
+        )
     return summary
 
 

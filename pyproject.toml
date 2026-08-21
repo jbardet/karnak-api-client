@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "karnak-api-client"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python client for the Karnak management REST API: transport client plus idempotent desired-state apply for profiles, projects, forward nodes, destinations and auth configs."
 readme = "README.md"
 requires-python = ">=3.10"
