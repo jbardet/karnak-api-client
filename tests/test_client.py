@@ -341,7 +341,7 @@ def test_list_pseudonyms_lists_all_not_project_scoped() -> None:
 
 def test_import_pseudonyms_posts_bulk_array() -> None:
     rows = [{"pseudonym": "PSY1", "patientId": "PAT1", "projectUUID": PROJECT_UUID}]
-    summary = {"created": 1, "conflict": 0, "error": 0, "rows": rows}
+    summary = {"created": 1, "conflict": 0, "error": 0, "issues": []}
     client, session = make_client([FakeResponse(200, summary)], auth_mode="basic")
     result = client.import_pseudonyms(rows)
     assert result == summary
@@ -350,16 +350,23 @@ def test_import_pseudonyms_posts_bulk_array() -> None:
 
 
 def test_import_pseudonyms_falls_back_per_row_on_404() -> None:
-    """Older Karnak without the fork's bulk endpoint: synthesise the summary."""
+    """Older Karnak without the fork's bulk endpoint: synthesise the summary.
+
+    Shape must mirror the server's ``PseudonymImportResult``/
+    ``PseudonymImportIssue``: an ``issues`` list (not ``rows``), one entry
+    per conflicting/errored row (not per row), each carrying ``index``,
+    ``reason``, and ``existing``.
+    """
     rows = [
         {"pseudonym": "PSY1", "patientId": "PAT1", "projectUUID": PROJECT_UUID},
         {"pseudonym": "PSY2", "patientId": "PAT2", "projectUUID": PROJECT_UUID},
     ]
+    existing = {"uuid": "p2", **rows[1]}
     client, session = make_client(
         [
             FakeResponse(404, "no such endpoint"),
             FakeResponse(201, {"uuid": "p1", **rows[0]}),
-            FakeResponse(409, {"uuid": "p2", **rows[1]}),
+            FakeResponse(409, existing),
         ],
         auth_mode="basic",
     )
@@ -367,13 +374,73 @@ def test_import_pseudonyms_falls_back_per_row_on_404() -> None:
     assert result["created"] == 1
     assert result["conflict"] == 1
     assert result["error"] == 0
-    assert len(result["rows"]) == 2
+    # Only the conflicting row (index 1) gets an issue — the created row
+    # (index 0) is just counted, same as the native endpoint.
+    assert result["issues"] == [
+        {
+            "index": 1,
+            "reason": "A pseudonym already exists for this patient and project",
+            "existing": existing,
+        }
+    ]
     urls = [c["url"] for c in session.calls]
     assert urls == [
         f"{BASE}/api/pseudonyms/import",
         f"{BASE}/api/pseudonyms",
         f"{BASE}/api/pseudonyms",
     ]
+
+
+def test_import_pseudonyms_fallback_error_row_has_no_existing() -> None:
+    """An error row (not a conflict) reports ``existing: None``, matching the
+
+    server's ``PseudonymImportIssue`` field, which is only populated for
+    conflicts.
+    """
+    rows = [{"pseudonym": "PSY1", "patientId": "PAT1", "projectUUID": PROJECT_UUID}]
+    client, session = make_client(
+        [
+            FakeResponse(404, "no such endpoint"),
+            FakeResponse(400, "validation failed"),
+        ],
+        auth_mode="basic",
+    )
+    result = client.import_pseudonyms(rows)
+    assert result["created"] == 0
+    assert result["conflict"] == 0
+    assert result["error"] == 1
+    assert len(result["issues"]) == 1
+    issue = result["issues"][0]
+    assert issue["index"] == 0
+    assert issue["existing"] is None
+    assert "reason" in issue
+
+
+def test_import_pseudonyms_fallback_matches_native_summary_keys() -> None:
+    """Whichever path `import_pseudonyms` takes, the summary shape is the same."""
+    rows = [{"pseudonym": "PSY1", "patientId": "PAT1", "projectUUID": PROJECT_UUID}]
+
+    native_client, _ = make_client(
+        [FakeResponse(200, {"created": 1, "conflict": 0, "error": 0, "issues": []})],
+        auth_mode="basic",
+    )
+    native_result = native_client.import_pseudonyms(rows)
+
+    fallback_client, _ = make_client(
+        [
+            FakeResponse(404, "no such endpoint"),
+            FakeResponse(201, {"uuid": "p1", **rows[0]}),
+        ],
+        auth_mode="basic",
+    )
+    fallback_result = fallback_client.import_pseudonyms(rows)
+
+    assert set(native_result.keys()) == set(fallback_result.keys()) == {
+        "created",
+        "conflict",
+        "error",
+        "issues",
+    }
 
 
 def test_delete_project_pseudonyms() -> None:

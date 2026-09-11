@@ -424,9 +424,15 @@ class KarnakClient:
         """POST /api/pseudonyms/import (fork-only bulk import).
 
         Falls back to one :meth:`create_pseudonym` call per row — and
-        synthesises the same ``{created, conflict, error, rows}`` summary
-        shape — when talking to an older Karnak that doesn't have the fork's
-        bulk-import patch (404).
+        synthesises the same ``{created, conflict, error, issues}`` summary
+        shape as the server's ``PseudonymImportResult`` — when talking to an
+        older Karnak that doesn't have the fork's bulk-import patch (404).
+
+        Each entry in ``issues`` mirrors the server's ``PseudonymImportIssue``:
+        ``index`` (0-based row index), ``reason``, and ``existing`` (the
+        conflicting ``PatientModel``, ``None`` for an error row). Only
+        conflicting/errored rows get an issue — a created row is just
+        counted, same as the native endpoint.
         """
         try:
             return self._request(
@@ -437,20 +443,26 @@ class KarnakClient:
                 raise
 
         created = conflict = error = 0
-        row_results: list[dict[str, Any]] = []
-        for row in rows:
+        issues: list[dict[str, Any]] = []
+        for index, row in enumerate(rows):
             try:
                 was_created, body = self._create_pseudonym_with_status(row)
             except KarnakApiError as row_exc:
                 error += 1
-                row_results.append({"error": str(row_exc), "row": row})
+                issues.append({"index": index, "reason": str(row_exc), "existing": None})
                 continue
             if was_created:
                 created += 1
             else:
                 conflict += 1
-            row_results.append(body)
-        return {"created": created, "conflict": conflict, "error": error, "rows": row_results}
+                issues.append(
+                    {
+                        "index": index,
+                        "reason": "A pseudonym already exists for this patient and project",
+                        "existing": body,
+                    }
+                )
+        return {"created": created, "conflict": conflict, "error": error, "issues": issues}
 
     def delete_project_pseudonyms(self, project_uuid: str) -> None:
         self._request("DELETE", f"/api/pseudonyms/project/{project_uuid}", expected={204})
