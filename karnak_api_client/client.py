@@ -1,25 +1,36 @@
-"""Authenticated transport client for the Karnak REST API.
+"""Authenticated transport client for the Karnak REST API (v2.0.0).
 
-The client intentionally mirrors the REST resources from API.md and keeps
-policy decisions out of the transport layer. Higher-level code decides what
-"apply" means (see ``karnak_api_client.apply``); this module only performs
-authenticated HTTP calls and returns JSON-compatible dictionaries/lists.
+The client intentionally mirrors the REST resources from the v2.0.0 OpenAPI
+spec and keeps policy decisions out of the transport layer. Higher-level code
+decides what "apply" means (see ``karnak_api_client.apply``); this module
+only performs authenticated HTTP calls and returns JSON-compatible
+dictionaries/lists.
+
+Resource keys are UUID strings in v2.0.0 (``{projectUuid}``, ``{profileUuid}``,
+``{forwardNodeUuid}``, ``{destinationUuid}``, ``{sourceNodeUuid}``,
+``{secretUuid}``) — every method that used to take an integer ``*_id`` now
+takes a ``*_uuid: str``.
 
 Authentication
 --------------
-Depending on how the Karnak image is configured, the REST API is reachable
-either with HTTP Basic (default in-memory IdP) or only through Spring
-form-login (POST ``/login`` once, then carry the ``JSESSIONID`` cookie).
-``auth_mode`` selects the behaviour:
+v2.0.0 has a dedicated stateless ``/api/**`` filter chain (CSRF disabled, no
+session): HTTP Basic under ``IDP=inmemory``, Bearer JWT under ``IDP=oidc``.
+Depending on how the Karnak image is configured this may still only be
+reachable through Spring form-login (POST ``/login`` once, then carry the
+``JSESSIONID`` cookie) — ``auth_mode`` selects the behaviour:
 
 - ``"basic"`` — HTTP Basic on every request, no fallback.
 - ``"form"``  — form-login before the first request, cookie afterwards.
 - ``"auto"``  (default) — try Basic; when the server answers 401 or redirects
   to ``/login``, switch to form-login transparently and retry once.
+
+Form login is a fallback, never a requirement: the default ``auto`` mode
+never performs it unless Basic is rejected first.
 """
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -259,92 +270,198 @@ class KarnakClient:
         return self._request("GET", "/api/profiles", expected={200, 204}) or []
 
     def upload_profile(self, path: Path | str) -> dict[str, Any]:
+        """POST /api/profiles/import — multipart YAML upload (unchanged shape
+
+        from the pre-v2.0.0 API; only the path moved from ``/api/profiles``).
+        """
         path = Path(path)
         # Read up-front so the auto-mode form-login retry can resend the body.
         payload = path.read_bytes()
         return self._request(
             "POST",
-            "/api/profiles",
+            "/api/profiles/import",
             files={"file": (path.name, payload, "application/x-yaml")},
             expected={201},
             timeout_sec=max(self.config.timeout_sec, 60.0),
         )
 
-    def get_profile(self, profile_id: int) -> dict[str, Any]:
-        return self._request("GET", f"/api/profiles/{profile_id}", expected={200})
+    def create_profile(self, body: dict[str, Any]) -> dict[str, Any]:
+        """POST /api/profiles — JSON create (ProfileInput: name, version, ...)."""
+        return self._request("POST", "/api/profiles", json_body=body, expected={201})
 
-    def update_profile(self, profile_id: int, body: dict[str, Any]) -> dict[str, Any]:
-        return self._request("PUT", f"/api/profiles/{profile_id}", json_body=body, expected={200})
+    def get_profile(self, profile_uuid: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/profiles/{profile_uuid}", expected={200})
 
-    def delete_profile(self, profile_id: int) -> None:
-        self._request("DELETE", f"/api/profiles/{profile_id}", expected={204})
+    def update_profile(self, profile_uuid: str, body: dict[str, Any]) -> dict[str, Any]:
+        return self._request(
+            "PUT", f"/api/profiles/{profile_uuid}", json_body=body, expected={200}
+        )
 
-    # ── projects / secrets ──────────────────────────────────────────────
+    def delete_profile(self, profile_uuid: str) -> None:
+        self._request("DELETE", f"/api/profiles/{profile_uuid}", expected={204})
+
+    # ── projects ─────────────────────────────────────────────────────────
 
     def list_projects(self) -> list[dict[str, Any]]:
         return self._request("GET", "/api/projects", expected={200, 204}) or []
 
-    def create_project(self, name: str, profile_id: int | None = None) -> dict[str, Any]:
-        body: dict[str, Any] = {"name": name}
-        if profile_id is not None:
-            body["profileId"] = profile_id
+    def create_project(self, name: str, profile_uuid: str) -> dict[str, Any]:
+        """POST /api/projects. ``profileUuid`` is required (``@NotNull``) —
+
+        v2.0.0 makes the project→profile link a first-class, settable field.
+        """
+        body = {"name": name, "profileUuid": profile_uuid}
         return self._request("POST", "/api/projects", json_body=body, expected={201})
 
-    def get_project(self, project_id: int) -> dict[str, Any]:
-        return self._request("GET", f"/api/projects/{project_id}", expected={200})
+    def get_project(self, project_uuid: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/projects/{project_uuid}", expected={200})
 
-    def update_project(
-        self,
-        project_id: int,
-        *,
-        name: str | None = None,
-        profile_id: int | None = None,
-        detach_profile: bool = False,
-    ) -> dict[str, Any]:
-        body: dict[str, Any] = {}
-        if name is not None:
-            body["name"] = name
-        if detach_profile:
-            body["profileId"] = None
-        elif profile_id is not None:
-            body["profileId"] = profile_id
-        return self._request("PUT", f"/api/projects/{project_id}", json_body=body, expected={200})
+    def update_project(self, project_uuid: str, *, name: str, profile_uuid: str) -> dict[str, Any]:
+        """PUT /api/projects/{uuid}.
 
-    def delete_project(self, project_id: int) -> None:
-        self._request("DELETE", f"/api/projects/{project_id}", expected={204})
+        Always sends the full model. v2.0.0 validates ``name`` (``@NotBlank``)
+        and ``profileUuid`` (``@NotNull``) on ProjectInput, so a partial/empty
+        PUT now returns 400 — there is no "detach profile" or "rename only"
+        shortcut any more. Callers that only want to touch the project
+        unchanged (to force Karnak to republish its destination config)
+        should use :meth:`touch_project` instead of reconstructing this call.
+        """
+        body = {"name": name, "profileUuid": profile_uuid}
+        return self._request(
+            "PUT", f"/api/projects/{project_uuid}", json_body=body, expected={200}
+        )
 
-    def add_project_secret(self, project_id: int, hex_key: str | None = None) -> dict[str, Any]:
-        body: dict[str, Any] = {}
+    def touch_project(self, project_uuid: str) -> dict[str, Any]:
+        """GET-then-PUT a project back unchanged.
+
+        REST writes to a project's destinations don't notify anything —
+        re-PUTting the project itself is what makes Karnak republish its
+        destination config to the pool (see MEMORY.md "Karnak config
+        propagation").
+        """
+        project = self.get_project(project_uuid)
+        return self.update_project(
+            project_uuid, name=project["name"], profile_uuid=project["profileUuid"]
+        )
+
+    def delete_project(self, project_uuid: str) -> None:
+        self._request("DELETE", f"/api/projects/{project_uuid}", expected={204})
+
+    # ── project secrets ─────────────────────────────────────────────────
+
+    def list_secrets(self, project_uuid: str) -> list[dict[str, Any]]:
+        return (
+            self._request("GET", f"/api/projects/{project_uuid}/secrets", expected={200, 204})
+            or []
+        )
+
+    def add_project_secret(self, project_uuid: str, hex_key: str | None = None) -> dict[str, Any]:
+        """Create a new active secret for a project.
+
+        ``hex_key`` given → ``POST .../secrets/import`` with body
+        ``{"key": hex_key}`` (32 hex chars, dashed groups allowed); otherwise
+        ``POST .../secrets/generate`` (random key). Both return 201 and
+        activate the new key, deactivating any previous one.
+        """
         if hex_key:
-            body["hexKey"] = hex_key
+            return self._request(
+                "POST",
+                f"/api/projects/{project_uuid}/secrets/import",
+                json_body={"key": hex_key},
+                expected={201},
+            )
         return self._request(
             "POST",
-            f"/api/projects/{project_id}/secrets",
-            json_body=body,
+            f"/api/projects/{project_uuid}/secrets/generate",
             expected={201},
         )
 
     # Alias kept for callers written against the original form-login client.
     generate_secret = add_project_secret
 
-    def list_external_ids(self, project_id: int) -> list[dict[str, Any]]:
-        return self._request("GET", f"/api/projects/{project_id}/external-ids", expected={200}) or []
-
-    def import_external_ids(self, project_id: int, rows: list[dict[str, Any]]) -> dict[str, Any]:
-        return self._request(
-            "POST",
-            f"/api/projects/{project_id}/external-ids/import",
-            json_body=rows,
-            expected={200},
+    def delete_secret(self, project_uuid: str, secret_uuid: str) -> None:
+        self._request(
+            "DELETE",
+            f"/api/projects/{project_uuid}/secrets/{secret_uuid}",
+            expected={204},
         )
+
+    # ── pseudonyms ───────────────────────────────────────────────────────
+    # Replaces the old /api/projects/{id}/external-ids (+ /import) resource,
+    # which is not project-scoped any more: GET lists ALL pseudonyms.
+
+    def list_pseudonyms(self) -> list[dict[str, Any]]:
+        return self._request("GET", "/api/pseudonyms", expected={200, 204}) or []
+
+    def _create_pseudonym_with_status(self, row: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        """POST one pseudonym. Returns ``(created, body)``.
+
+        ``created=False`` means the server answered 409 (a pseudonym already
+        exists for this patient + project) and ``body`` is the existing
+        PatientModel from the conflict response.
+        """
+        try:
+            body = self._request("POST", "/api/pseudonyms", json_body=row, expected={201})
+            return True, body
+        except KarnakApiError as exc:
+            if exc.status_code != 409:
+                raise
+            try:
+                body = json.loads(exc.body) if exc.body else {}
+            except json.JSONDecodeError:
+                body = {}
+            return False, body
+
+    def create_pseudonym(self, row: dict[str, Any]) -> dict[str, Any]:
+        """POST /api/pseudonyms. Idempotent: HTTP 409 (already exists) is
+
+        treated as success and returns the existing PatientModel.
+        """
+        _created, body = self._create_pseudonym_with_status(row)
+        return body
+
+    def import_pseudonyms(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        """POST /api/pseudonyms/import (fork-only bulk import).
+
+        Falls back to one :meth:`create_pseudonym` call per row — and
+        synthesises the same ``{created, conflict, error, rows}`` summary
+        shape — when talking to an older Karnak that doesn't have the fork's
+        bulk-import patch (404).
+        """
+        try:
+            return self._request(
+                "POST", "/api/pseudonyms/import", json_body=rows, expected={200}
+            )
+        except KarnakApiError as exc:
+            if exc.status_code != 404:
+                raise
+
+        created = conflict = error = 0
+        row_results: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                was_created, body = self._create_pseudonym_with_status(row)
+            except KarnakApiError as row_exc:
+                error += 1
+                row_results.append({"error": str(row_exc), "row": row})
+                continue
+            if was_created:
+                created += 1
+            else:
+                conflict += 1
+            row_results.append(body)
+        return {"created": created, "conflict": conflict, "error": error, "rows": row_results}
+
+    def delete_project_pseudonyms(self, project_uuid: str) -> None:
+        self._request("DELETE", f"/api/pseudonyms/project/{project_uuid}", expected={204})
 
     # ── forward nodes / sources / destinations ──────────────────────────
 
     def list_forward_nodes(self) -> list[dict[str, Any]]:
         return self._request("GET", "/api/forward-nodes", expected={200, 204}) or []
 
-    def get_forward_node(self, forward_node_id: int) -> dict[str, Any]:
-        return self._request("GET", f"/api/forward-nodes/{forward_node_id}", expected={200})
+    def get_forward_node(self, forward_node_uuid: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/forward-nodes/{forward_node_uuid}", expected={200})
 
     def create_forward_node(self, ae_title: str, description: str = "") -> dict[str, Any]:
         return self._request(
@@ -356,53 +473,59 @@ class KarnakClient:
 
     def update_forward_node(
         self,
-        forward_node_id: int,
+        forward_node_uuid: str,
         ae_title: str,
         description: str = "",
     ) -> dict[str, Any]:
         return self._request(
             "PUT",
-            f"/api/forward-nodes/{forward_node_id}",
+            f"/api/forward-nodes/{forward_node_uuid}",
             json_body={"fwdAeTitle": ae_title, "fwdDescription": description},
             expected={200},
         )
 
-    def delete_forward_node(self, forward_node_id: int) -> None:
-        self._request("DELETE", f"/api/forward-nodes/{forward_node_id}", expected={204})
+    def delete_forward_node(self, forward_node_uuid: str) -> None:
+        self._request("DELETE", f"/api/forward-nodes/{forward_node_uuid}", expected={204})
 
-    def list_source_nodes(self, forward_node_id: int) -> list[dict[str, Any]]:
-        return self._request(
-            "GET",
-            f"/api/forward-nodes/{forward_node_id}/source-nodes",
-            expected={200, 204},
-        ) or []
+    def list_source_nodes(self, forward_node_uuid: str) -> list[dict[str, Any]]:
+        return (
+            self._request(
+                "GET",
+                f"/api/forward-nodes/{forward_node_uuid}/source-nodes",
+                expected={200, 204},
+            )
+            or []
+        )
 
-    def add_source_node(self, forward_node_id: int, body: dict[str, Any]) -> dict[str, Any]:
+    def add_source_node(self, forward_node_uuid: str, body: dict[str, Any]) -> dict[str, Any]:
         return self._request(
             "POST",
-            f"/api/forward-nodes/{forward_node_id}/source-nodes",
+            f"/api/forward-nodes/{forward_node_uuid}/source-nodes",
             json_body=body,
             expected={201},
         )
 
-    def delete_source_node(self, forward_node_id: int, source_node_id: int) -> None:
+    def delete_source_node(self, forward_node_uuid: str, source_node_uuid: str) -> None:
         self._request(
             "DELETE",
-            f"/api/forward-nodes/{forward_node_id}/source-nodes/{source_node_id}",
+            f"/api/forward-nodes/{forward_node_uuid}/source-nodes/{source_node_uuid}",
             expected={204},
         )
 
-    def list_destinations(self, forward_node_id: int) -> list[dict[str, Any]]:
-        return self._request(
-            "GET",
-            f"/api/forward-nodes/{forward_node_id}/destinations",
-            expected={200, 204},
-        ) or []
+    def list_destinations(self, forward_node_uuid: str) -> list[dict[str, Any]]:
+        return (
+            self._request(
+                "GET",
+                f"/api/forward-nodes/{forward_node_uuid}/destinations",
+                expected={200, 204},
+            )
+            or []
+        )
 
-    def add_destination(self, forward_node_id: int, body: dict[str, Any]) -> dict[str, Any]:
+    def add_destination(self, forward_node_uuid: str, body: dict[str, Any]) -> dict[str, Any]:
         return self._request(
             "POST",
-            f"/api/forward-nodes/{forward_node_id}/destinations",
+            f"/api/forward-nodes/{forward_node_uuid}/destinations",
             json_body=body,
             expected={201},
         )
@@ -412,25 +535,27 @@ class KarnakClient:
 
     def update_destination(
         self,
-        forward_node_id: int,
-        destination_id: int,
+        forward_node_uuid: str,
+        destination_uuid: str,
         body: dict[str, Any],
     ) -> dict[str, Any]:
         return self._request(
             "PUT",
-            f"/api/forward-nodes/{forward_node_id}/destinations/{destination_id}",
+            f"/api/forward-nodes/{forward_node_uuid}/destinations/{destination_uuid}",
             json_body=body,
             expected={200},
         )
 
-    def delete_destination(self, forward_node_id: int, destination_id: int) -> None:
+    def delete_destination(self, forward_node_uuid: str, destination_uuid: str) -> None:
         self._request(
             "DELETE",
-            f"/api/forward-nodes/{forward_node_id}/destinations/{destination_id}",
+            f"/api/forward-nodes/{forward_node_uuid}/destinations/{destination_uuid}",
             expected={204},
         )
 
-    # ── auth configs ────────────────────────────────────────────────────
+    # ── auth configs ─────────────────────────────────────────────────────
+    # Fork-only (upstream v2.0.0 removed this resource): keyed on the string
+    # `code`, not a uuid. Not in the v2.0.0 OpenAPI spec.
 
     def list_auth_configs(self) -> list[dict[str, Any]]:
         return self._request("GET", "/api/auth-configs", expected={200, 204}) or []
@@ -441,10 +566,28 @@ class KarnakClient:
     def update_auth_config(self, code: str, body: dict[str, Any]) -> dict[str, Any]:
         return self._request("PUT", f"/api/auth-configs/{code}", json_body=body, expected={200})
 
+    def delete_auth_config(self, code: str) -> None:
+        self._request("DELETE", f"/api/auth-configs/{code}", expected={204})
+
     # ── monitoring ──────────────────────────────────────────────────────
+    # Criteria keys are the v2.0.0 names (statusType, destinationUuid,
+    # studyUid, serieUid, sopInstanceUid, start, end) — callers must pass
+    # those; the old `status` / `destinationId` names are not translated.
 
-    def query_transfers(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        return self._request("GET", "/api/monitoring/transfers", params=params or {}, expected={200})
+    def query_transfers(self, params: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        """GET /api/monitoring/transfers. Accepts page/size/sort in ``params``.
 
-    def count_transfers(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        return self._request("GET", "/api/monitoring/transfers/count", params=params or {}, expected={200})
+        Returns the Spring Data ``Page`` object as-is:
+        ``{"content": [...], "totalElements": N, "totalPages": N, "number": N,
+        "size": N}`` (or ``None`` on 204 — no transfers matched).
+        """
+        return self._request(
+            "GET", "/api/monitoring/transfers", params=params or {}, expected={200, 204}
+        )
+
+    def count_transfers(self, params: dict[str, Any] | None = None) -> int:
+        """GET /api/monitoring/transfers/count. Returns a bare int, not a dict."""
+        result = self._request(
+            "GET", "/api/monitoring/transfers/count", params=params or {}, expected={200}
+        )
+        return int(result)
