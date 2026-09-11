@@ -1,8 +1,9 @@
-"""Python client for the Karnak management REST API.
+"""Python client for the Karnak management REST API (v2.0.0).
 
 Transport client (``client``) plus idempotent desired-state apply
-(``apply``). Endpoint reference:
-https://github.com/nroduit/karnak/blob/master/API.md
+(``apply``). Endpoint reference: the v2.0.0 OpenAPI spec
+(``api-collection/karnak-api.openapi.yaml`` in the Karnak fork repo) plus the
+fork's auth-configs and pseudonym-bulk-import extensions.
 """
 
 from .apply import (
@@ -21,7 +22,7 @@ from .client import (
     KarnakError,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "ApiError",

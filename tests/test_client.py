@@ -1,4 +1,4 @@
-"""Unit tests for the unified Karnak client (auth modes + transport)."""
+"""Unit tests for the unified Karnak v2.0.0 client (auth modes + transport)."""
 
 from __future__ import annotations
 
@@ -18,6 +18,9 @@ from karnak_api_client import (
 )
 
 BASE = "http://karnak.test:8081"
+
+PROFILE_UUID = "11111111-1111-1111-1111-111111111111"
+PROJECT_UUID = "22222222-2222-2222-2222-222222222222"
 
 
 def make_config(auth_mode: str = "auto") -> KarnakClientConfig:
@@ -97,8 +100,8 @@ def login_redirect() -> FakeResponse:
 
 
 def test_basic_mode_sends_basic_auth_and_parses_json() -> None:
-    client, session = make_client([FakeResponse(200, [{"id": 1}])], auth_mode="basic")
-    assert client.list_profiles() == [{"id": 1}]
+    client, session = make_client([FakeResponse(200, [{"uuid": PROFILE_UUID}])], auth_mode="basic")
+    assert client.list_profiles() == [{"uuid": PROFILE_UUID}]
     call = session.calls[0]
     assert call["auth"] is not None
     assert call["allow_redirects"] is False
@@ -117,8 +120,8 @@ def test_basic_mode_does_not_fall_back_on_401() -> None:
 
 @pytest.mark.parametrize("first", [login_redirect(), FakeResponse(401, "nope")])
 def test_auto_mode_falls_back_to_form_login(first: FakeResponse) -> None:
-    client, session = make_client([first, login_ok(), FakeResponse(200, [{"id": 7}])])
-    assert client.list_profiles() == [{"id": 7}]
+    client, session = make_client([first, login_ok(), FakeResponse(200, [{"uuid": PROFILE_UUID}])])
+    assert client.list_profiles() == [{"uuid": PROFILE_UUID}]
     methods = [(c["method"], c["url"]) for c in session.calls]
     assert methods == [
         ("GET", f"{BASE}/api/profiles"),
@@ -154,10 +157,10 @@ def test_form_mode_logs_in_before_first_request() -> None:
 
 def test_form_mode_relogins_when_session_expires() -> None:
     client, session = make_client(
-        [login_ok(), login_redirect(), login_ok(), FakeResponse(200, [{"id": 2}])],
+        [login_ok(), login_redirect(), login_ok(), FakeResponse(200, [{"uuid": PROFILE_UUID}])],
         auth_mode="form",
     )
-    assert client.list_profiles() == [{"id": 2}]
+    assert client.list_profiles() == [{"uuid": PROFILE_UUID}]
     assert session.cookies.cleared == 1
     methods = [(c["method"], c["url"]) for c in session.calls]
     assert methods == [
@@ -191,7 +194,7 @@ def test_204_responses_map_to_empty_list() -> None:
 def test_unexpected_status_raises_api_error_with_details() -> None:
     client, _ = make_client([FakeResponse(500, "boom")], auth_mode="basic")
     with pytest.raises(KarnakApiError) as exc:
-        client.get_project(3)
+        client.get_project(PROJECT_UUID)
     assert exc.value.status_code == 500
     assert exc.value.method == "GET"
     assert "boom" in exc.value.body
@@ -208,21 +211,211 @@ def test_connection_error_wrapped_as_karnak_error() -> None:
         client.check_connectivity()
 
 
-def test_upload_profile_accepts_str_and_survives_form_fallback(tmp_path: Path) -> None:
+def test_upload_profile_posts_to_import_and_survives_form_fallback(tmp_path: Path) -> None:
     profile = tmp_path / "p.yml"
     profile.write_bytes(b"name: X\n")
     client, session = make_client(
-        [login_redirect(), login_ok(), FakeResponse(201, {"id": 12, "name": "X"})]
+        [login_redirect(), login_ok(), FakeResponse(201, {"uuid": PROFILE_UUID, "name": "X"})]
     )
     created = client.upload_profile(str(profile))
-    assert created["id"] == 12
-    # Both the first attempt and the retry carried the file payload.
-    uploads = [c for c in session.calls if c["url"].endswith("/api/profiles")]
+    assert created["uuid"] == PROFILE_UUID
+    # Both the first attempt and the retry carried the file payload, against
+    # the v2.0.0 /import path (bare POST /api/profiles is now a JSON create).
+    uploads = [c for c in session.calls if c["url"].endswith("/api/profiles/import")]
+    assert len(uploads) == 2
     for call in uploads:
         name, payload, content_type = call["files"]["file"]
         assert name == "p.yml"
         assert payload == b"name: X\n"
         assert content_type == "application/x-yaml"
+
+
+def test_create_profile_posts_json_to_bare_profiles_path() -> None:
+    client, session = make_client([FakeResponse(201, {"uuid": PROFILE_UUID, "name": "X"})], auth_mode="basic")
+    body = {"name": "X", "version": "1.0"}
+    created = client.create_profile(body)
+    assert created["uuid"] == PROFILE_UUID
+    call = session.calls[0]
+    assert call["url"] == f"{BASE}/api/profiles"
+    assert call["json"] == body
+
+
+# ── projects ─────────────────────────────────────────────────────────────────
+
+
+def test_create_project_sends_profile_uuid() -> None:
+    client, session = make_client(
+        [FakeResponse(201, {"uuid": PROJECT_UUID, "name": "P", "profileUuid": PROFILE_UUID})],
+        auth_mode="basic",
+    )
+    project = client.create_project("P", PROFILE_UUID)
+    assert project["uuid"] == PROJECT_UUID
+    assert session.calls[0]["json"] == {"name": "P", "profileUuid": PROFILE_UUID}
+
+
+def test_update_project_always_sends_full_body() -> None:
+    client, session = make_client(
+        [FakeResponse(200, {"uuid": PROJECT_UUID, "name": "P2", "profileUuid": PROFILE_UUID})],
+        auth_mode="basic",
+    )
+    client.update_project(PROJECT_UUID, name="P2", profile_uuid=PROFILE_UUID)
+    assert session.calls[0]["json"] == {"name": "P2", "profileUuid": PROFILE_UUID}
+
+
+def test_touch_project_gets_then_puts_unchanged() -> None:
+    client, session = make_client(
+        [
+            FakeResponse(200, {"uuid": PROJECT_UUID, "name": "P", "profileUuid": PROFILE_UUID}),
+            FakeResponse(200, {"uuid": PROJECT_UUID, "name": "P", "profileUuid": PROFILE_UUID}),
+        ],
+        auth_mode="basic",
+    )
+    result = client.touch_project(PROJECT_UUID)
+    assert result["uuid"] == PROJECT_UUID
+    methods = [(c["method"], c["url"]) for c in session.calls]
+    assert methods == [
+        ("GET", f"{BASE}/api/projects/{PROJECT_UUID}"),
+        ("PUT", f"{BASE}/api/projects/{PROJECT_UUID}"),
+    ]
+    assert session.calls[1]["json"] == {"name": "P", "profileUuid": PROFILE_UUID}
+
+
+# ── secrets ──────────────────────────────────────────────────────────────────
+
+
+def test_add_project_secret_without_hex_key_calls_generate() -> None:
+    client, session = make_client([FakeResponse(201, {"uuid": "s1", "key": "abc", "active": True})], auth_mode="basic")
+    client.add_project_secret(PROJECT_UUID)
+    call = session.calls[0]
+    assert call["url"] == f"{BASE}/api/projects/{PROJECT_UUID}/secrets/generate"
+    assert call["method"] == "POST"
+
+
+def test_add_project_secret_with_hex_key_calls_import() -> None:
+    client, session = make_client([FakeResponse(201, {"uuid": "s1", "key": "deadbeef", "active": True})], auth_mode="basic")
+    client.add_project_secret(PROJECT_UUID, hex_key="deadbeef")
+    call = session.calls[0]
+    assert call["url"] == f"{BASE}/api/projects/{PROJECT_UUID}/secrets/import"
+    assert call["json"] == {"key": "deadbeef"}
+
+
+def test_list_secrets_returns_empty_list_on_204() -> None:
+    client, _ = make_client([FakeResponse(204)], auth_mode="basic")
+    assert client.list_secrets(PROJECT_UUID) == []
+
+
+def test_delete_secret_expects_204() -> None:
+    client, session = make_client([FakeResponse(204)], auth_mode="basic")
+    client.delete_secret(PROJECT_UUID, "s1")
+    assert session.calls[0]["url"] == f"{BASE}/api/projects/{PROJECT_UUID}/secrets/s1"
+    assert session.calls[0]["method"] == "DELETE"
+
+
+# ── pseudonyms ───────────────────────────────────────────────────────────────
+
+
+def test_create_pseudonym_treats_409_as_success() -> None:
+    """Regression: 409 (already exists) must be swallowed, not raised."""
+    existing = {"uuid": "p1", "pseudonym": "PSY1", "patientId": "PAT1", "projectUUID": PROJECT_UUID}
+    client, session = make_client([FakeResponse(409, existing)], auth_mode="basic")
+    result = client.create_pseudonym(
+        {"pseudonym": "PSY1", "patientId": "PAT1", "projectUUID": PROJECT_UUID}
+    )
+    assert result == existing
+    assert session.calls[0]["method"] == "POST"
+
+
+def test_create_pseudonym_raises_on_other_errors() -> None:
+    client, _ = make_client([FakeResponse(400, "bad")], auth_mode="basic")
+    with pytest.raises(KarnakApiError) as exc:
+        client.create_pseudonym({"pseudonym": "PSY1"})
+    assert exc.value.status_code == 400
+
+
+def test_list_pseudonyms_lists_all_not_project_scoped() -> None:
+    client, session = make_client([FakeResponse(200, [{"uuid": "p1"}])], auth_mode="basic")
+    result = client.list_pseudonyms()
+    assert result == [{"uuid": "p1"}]
+    assert session.calls[0]["url"] == f"{BASE}/api/pseudonyms"
+
+
+def test_import_pseudonyms_posts_bulk_array() -> None:
+    rows = [{"pseudonym": "PSY1", "patientId": "PAT1", "projectUUID": PROJECT_UUID}]
+    summary = {"created": 1, "conflict": 0, "error": 0, "rows": rows}
+    client, session = make_client([FakeResponse(200, summary)], auth_mode="basic")
+    result = client.import_pseudonyms(rows)
+    assert result == summary
+    assert session.calls[0]["url"] == f"{BASE}/api/pseudonyms/import"
+    assert session.calls[0]["json"] == rows
+
+
+def test_import_pseudonyms_falls_back_per_row_on_404() -> None:
+    """Older Karnak without the fork's bulk endpoint: synthesise the summary."""
+    rows = [
+        {"pseudonym": "PSY1", "patientId": "PAT1", "projectUUID": PROJECT_UUID},
+        {"pseudonym": "PSY2", "patientId": "PAT2", "projectUUID": PROJECT_UUID},
+    ]
+    client, session = make_client(
+        [
+            FakeResponse(404, "no such endpoint"),
+            FakeResponse(201, {"uuid": "p1", **rows[0]}),
+            FakeResponse(409, {"uuid": "p2", **rows[1]}),
+        ],
+        auth_mode="basic",
+    )
+    result = client.import_pseudonyms(rows)
+    assert result["created"] == 1
+    assert result["conflict"] == 1
+    assert result["error"] == 0
+    assert len(result["rows"]) == 2
+    urls = [c["url"] for c in session.calls]
+    assert urls == [
+        f"{BASE}/api/pseudonyms/import",
+        f"{BASE}/api/pseudonyms",
+        f"{BASE}/api/pseudonyms",
+    ]
+
+
+def test_delete_project_pseudonyms() -> None:
+    client, session = make_client([FakeResponse(204)], auth_mode="basic")
+    client.delete_project_pseudonyms(PROJECT_UUID)
+    assert session.calls[0]["url"] == f"{BASE}/api/pseudonyms/project/{PROJECT_UUID}"
+    assert session.calls[0]["method"] == "DELETE"
+
+
+# ── monitoring ───────────────────────────────────────────────────────────────
+
+
+def test_query_transfers_returns_page_shape_as_is() -> None:
+    page = {
+        "content": [{"forwardAeTitle": "FWD"}],
+        "totalElements": 1,
+        "totalPages": 1,
+        "number": 0,
+        "size": 20,
+    }
+    client, session = make_client([FakeResponse(200, page)], auth_mode="basic")
+    result = client.query_transfers({"statusType": "SENT", "page": 0, "size": 20})
+    assert result == page
+    assert session.calls[0]["params"] == {"statusType": "SENT", "page": 0, "size": 20}
+
+
+def test_count_transfers_returns_bare_int_not_dict() -> None:
+    """Regression: /transfers/count returns a bare integer body."""
+    client, _ = make_client([FakeResponse(200, 42)], auth_mode="basic")
+    result = client.count_transfers({"statusType": "ALL"})
+    assert result == 42
+    assert isinstance(result, int)
+
+
+# ── auth configs (fork-only) ──────────────────────────────────────────────────
+
+
+def test_delete_auth_config() -> None:
+    client, session = make_client([FakeResponse(204)], auth_mode="basic")
+    client.delete_auth_config("chuv-oidc")
+    assert session.calls[0]["url"] == f"{BASE}/api/auth-configs/chuv-oidc"
+    assert session.calls[0]["method"] == "DELETE"
 
 
 # ── compatibility surface ───────────────────────────────────────────────────
