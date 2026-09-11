@@ -2,8 +2,8 @@
 
 ``apply_config(client, config)`` takes a JSON-compatible config document
 describing the desired profile, project (+ HMAC secret), auth configs,
-forward node, source nodes, destinations and external-ID imports, and makes
-the minimum API calls needed to converge Karnak onto that state.
+forward node, source nodes, destinations and external-ID (pseudonym) imports,
+and makes the minimum API calls needed to converge Karnak onto that state.
 """
 
 from __future__ import annotations
@@ -127,7 +127,7 @@ def _ensure_profile(client: KarnakClient, config: dict[str, Any]) -> dict[str, A
         existing = _find_profile(client, name=name, version=version)
         if existing:
             return {
-                "id": int(existing["id"]),
+                "uuid": str(existing["uuid"]),
                 "name": existing.get("name", name),
                 "version": existing.get("version", version),
                 "created": False,
@@ -135,7 +135,7 @@ def _ensure_profile(client: KarnakClient, config: dict[str, Any]) -> dict[str, A
 
     created = client.upload_profile(path)
     return {
-        "id": int(created["id"]),
+        "uuid": str(created["uuid"]),
         "name": created.get("name", name),
         "version": version,
         "created": True,
@@ -149,17 +149,15 @@ def _find_project(client: KarnakClient, name: str) -> dict[str, Any] | None:
     return None
 
 
-def _project_has_active_secret(project: dict[str, Any]) -> bool:
-    secrets = project.get("secretEntities") or []
-    if not isinstance(secrets, list):
-        return False
+def _project_has_active_secret(client: KarnakClient, project_uuid: str) -> bool:
+    secrets = client.list_secrets(project_uuid)
     return any(bool(s.get("active")) for s in secrets if isinstance(s, dict))
 
 
 def _ensure_project(
     client: KarnakClient,
     config: dict[str, Any],
-    profile_id: int,
+    profile_uuid: str,
 ) -> dict[str, Any]:
     project_cfg = _require_object(config, "project")
     name = str(project_cfg.get("name", "")).strip()
@@ -168,37 +166,28 @@ def _ensure_project(
 
     existing = _find_project(client, name)
     if existing:
-        project_id = int(existing["id"])
-        # Skip PUT if the existing project's linked profile already matches by name.
-        # GET /api/projects responses don't include profileEntity.id, so compare
-        # by name+version which is what _ensure_profile guarantees stable on.
-        pe = existing.get("profileEntity") or {}
-        profile_cfg = _require_object(config, "profile")
-        desired_name = str(profile_cfg.get("name", "")).strip()
-        desired_version = str(profile_cfg.get("version", "")).strip()
-        already_matches = (
-            str(pe.get("name", "")).strip() == desired_name
-            and str(pe.get("version", "")).strip() == desired_version
-        )
-        if not already_matches:
-            client.update_project(project_id, profile_id=profile_id)
+        project_uuid = str(existing["uuid"])
+        # Unlike the old API, the project→profile link IS expressible over
+        # REST now (ProjectModel.profileUuid) — bind whenever it drifts from
+        # the desired profile instead of leaving it unset.
+        if str(existing.get("profileUuid", "")) != profile_uuid:
+            client.update_project(project_uuid, name=name, profile_uuid=profile_uuid)
         created = False
     else:
-        project = client.create_project(name, profile_id=profile_id)
-        project_id = int(project["id"])
+        project = client.create_project(name, profile_uuid)
+        project_uuid = str(project["uuid"])
         created = True
 
-    project = client.get_project(project_id)
     secret_created = False
     secret_result: dict[str, Any] | None = None
     ensure_secret = bool(project_cfg.get("ensureSecret", True))
     secret_hex = project_cfg.get("secretHex")
-    if secret_hex or (ensure_secret and not _project_has_active_secret(project)):
-        secret_result = client.add_project_secret(project_id, str(secret_hex) if secret_hex else None)
+    if secret_hex or (ensure_secret and not _project_has_active_secret(client, project_uuid)):
+        secret_result = client.add_project_secret(project_uuid, str(secret_hex) if secret_hex else None)
         secret_created = True
 
     summary: dict[str, Any] = {
-        "id": project_id,
+        "uuid": project_uuid,
         "name": name,
         "created": created,
         "secret_created": secret_created,
@@ -250,13 +239,13 @@ def _ensure_forward_node(client: KarnakClient, config: dict[str, Any]) -> dict[s
 
     existing = _find_forward_node(client, ae_title)
     if existing:
-        node = client.update_forward_node(int(existing["id"]), ae_title, description)
+        node = client.update_forward_node(str(existing["uuid"]), ae_title, description)
         created = False
     else:
         node = client.create_forward_node(ae_title, description)
         created = True
     return {
-        "id": int(node["id"]),
+        "uuid": str(node["uuid"]),
         "ae_title": ae_title,
         "created": created,
     }
@@ -272,13 +261,13 @@ def _source_key(source: dict[str, Any]) -> tuple[str, str, bool]:
 
 def _ensure_sources(
     client: KarnakClient,
-    forward_node_id: int,
+    forward_node_uuid: str,
     config: dict[str, Any],
 ) -> list[dict[str, Any]]:
     requested = _require_list(config, "sourceNodes")
     existing_keys = {
         _source_key(item)
-        for item in client.list_source_nodes(forward_node_id)
+        for item in client.list_source_nodes(forward_node_uuid)
         if isinstance(item, dict)
     }
     summary: list[dict[str, Any]] = []
@@ -291,9 +280,9 @@ def _ensure_sources(
         if key in existing_keys:
             summary.append({"aeTitle": body.get("aeTitle"), "created": False})
             continue
-        created = client.add_source_node(forward_node_id, body)
+        created = client.add_source_node(forward_node_uuid, body)
         existing_keys.add(key)
-        summary.append({"id": created.get("id"), "aeTitle": body.get("aeTitle"), "created": True})
+        summary.append({"uuid": created.get("uuid"), "aeTitle": body.get("aeTitle"), "created": True})
     return summary
 
 
@@ -306,8 +295,8 @@ def _destination_key(destination: dict[str, Any]) -> tuple[str, str]:
 
 def _ensure_destinations(
     client: KarnakClient,
-    forward_node_id: int,
-    project_id: int,
+    forward_node_uuid: str,
+    project_uuid: str,
     config: dict[str, Any],
 ) -> list[dict[str, Any]]:
     """Converge a forward node's destinations onto ``config["destinations"]``.
@@ -330,7 +319,7 @@ def _ensure_destinations(
     reconcile = bool(config.get("reconcileDestinations", True))
     existing_by_key = {
         _destination_key(item): item
-        for item in client.list_destinations(forward_node_id)
+        for item in client.list_destinations(forward_node_uuid)
         if isinstance(item, dict)
     }
     requested_keys: set[tuple[str, str]] = set()
@@ -339,10 +328,10 @@ def _ensure_destinations(
         if not isinstance(raw_body, dict):
             raise KarnakConfigError("destinations entries must be objects")
         body = dict(raw_body)
-        if body.get("desidentification") and not body.get("deIdentificationProject"):
-            body["deIdentificationProject"] = {"id": project_id}
-        if body.get("activateTagMorphing") and not body.get("tagMorphingProject"):
-            body["tagMorphingProject"] = {"id": project_id}
+        if body.get("desidentification") and not body.get("deIdentificationProjectUuid"):
+            body["deIdentificationProjectUuid"] = project_uuid
+        if body.get("activateTagMorphing") and not body.get("tagMorphingProjectUuid"):
+            body["tagMorphingProjectUuid"] = project_uuid
 
         key = _destination_key(body)
         if not key[1]:
@@ -350,7 +339,7 @@ def _ensure_destinations(
         requested_keys.add(key)
         existing = existing_by_key.get(key)
         if existing:
-            destination_id = int(existing["id"])
+            destination_uuid = str(existing["uuid"])
             if _matches(existing, body):
                 # Nothing to change. Skipping the write is not just an
                 # optimisation: Karnak's PUT on an existing destination
@@ -358,26 +347,26 @@ def _ensure_destinations(
                 # the forward node), so re-applying an unchanged config would
                 # silently leave the gateway with nowhere to deliver.
                 summary.append(
-                    {"id": destination_id, "key": list(key), "created": False, "unchanged": True}
+                    {"uuid": destination_uuid, "key": list(key), "created": False, "unchanged": True}
                 )
                 continue
             # A real change. PUT is unusable (see above), so replace: the
-            # destination id changes and its transfer history goes with it,
+            # destination uuid changes and its transfer history goes with it,
             # which is the lesser evil against a node left with no destination.
-            client.delete_destination(forward_node_id, destination_id)
-            created = client.add_destination(forward_node_id, body)
-            destination_id = int(created.get("id", 0)) if isinstance(created, dict) else 0
+            client.delete_destination(forward_node_uuid, destination_uuid)
+            created = client.add_destination(forward_node_uuid, body)
+            destination_uuid = str(created.get("uuid", "")) if isinstance(created, dict) else ""
             summary.append(
-                {"id": destination_id, "key": list(key), "created": True, "replaced": True}
+                {"uuid": destination_uuid, "key": list(key), "created": True, "replaced": True}
             )
         else:
-            created = client.add_destination(forward_node_id, body)
-            destination_id = int(created.get("id", 0)) if isinstance(created, dict) else 0
-            summary.append({"id": destination_id, "key": list(key), "created": True})
+            created = client.add_destination(forward_node_uuid, body)
+            destination_uuid = str(created.get("uuid", "")) if isinstance(created, dict) else ""
+            summary.append({"uuid": destination_uuid, "key": list(key), "created": True})
 
     if reconcile:
         summary.extend(
-            _deactivate_unrequested(client, forward_node_id, existing_by_key, requested_keys)
+            _deactivate_unrequested(client, forward_node_uuid, existing_by_key, requested_keys)
         )
     return summary
 
@@ -387,16 +376,13 @@ def _matches(existing: dict[str, Any], desired: dict[str, Any]) -> bool:
     """True when every field the desired config sets already has that value.
 
     Only the keys we manage are compared — Karnak decorates a destination with
-    server-side fields (ids, timestamps, association state) that must not count
-    as drift, or every apply would look like a change and trigger a replace.
+    server-side fields (uuid, timestamps, association state) that must not
+    count as drift, or every apply would look like a change and trigger a
+    replace. ``deIdentificationProjectUuid`` / ``tagMorphingProjectUuid`` are
+    flat uuid strings in v2.0.0, so no special nested-object handling is
+    needed for them any more — plain equality covers everything.
     """
     for field, want in desired.items():
-        if field in ("deIdentificationProject", "tagMorphingProject"):
-            # Compare by id; the server echoes a fully expanded project object.
-            have = existing.get(field) or {}
-            if not isinstance(have, dict) or have.get("id") != (want or {}).get("id"):
-                return False
-            continue
         if existing.get(field) != want:
             return False
     return True
@@ -404,7 +390,7 @@ def _matches(existing: dict[str, Any], desired: dict[str, Any]) -> bool:
 
 def _deactivate_unrequested(
     client: KarnakClient,
-    forward_node_id: int,
+    forward_node_uuid: str,
     existing_by_key: dict[tuple[str, str], dict[str, Any]],
     requested_keys: set[tuple[str, str]],
 ) -> list[dict[str, Any]]:
@@ -417,28 +403,30 @@ def _deactivate_unrequested(
         # repeated applies free of pointless writes.
         if not existing.get("activate", True):
             continue
-        destination_id = int(existing["id"])
+        destination_uuid = str(existing["uuid"])
         merged = dict(existing)
         merged["activate"] = False
-        client.update_destination(forward_node_id, destination_id, merged)
+        client.update_destination(forward_node_uuid, destination_uuid, merged)
         summary.append(
-            {"id": destination_id, "key": list(key), "created": False, "deactivated": True}
+            {"uuid": destination_uuid, "key": list(key), "created": False, "deactivated": True}
         )
     return summary
 
 
 def apply_config(client: KarnakClient, config: dict[str, Any]) -> dict[str, Any]:
     profile = _ensure_profile(client, config)
-    project = _ensure_project(client, config, int(profile["id"]))
+    project = _ensure_project(client, config, str(profile["uuid"]))
     auth_configs = _ensure_auth_configs(client, config)
     forward_node = _ensure_forward_node(client, config)
-    sources = _ensure_sources(client, int(forward_node["id"]), config)
-    destinations = _ensure_destinations(client, int(forward_node["id"]), int(project["id"]), config)
+    sources = _ensure_sources(client, str(forward_node["uuid"]), config)
+    destinations = _ensure_destinations(
+        client, str(forward_node["uuid"]), str(project["uuid"]), config
+    )
 
     external_rows = _load_external_ids(config)
     external_import: dict[str, Any] | None = None
     if external_rows:
-        external_import = client.import_external_ids(int(project["id"]), external_rows)
+        external_import = client.import_pseudonyms(external_rows)
 
     return {
         "profile": profile,
