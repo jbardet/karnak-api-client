@@ -13,7 +13,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .client import KarnakClient
+from .client import KarnakApiError, KarnakClient
 
 
 class KarnakConfigError(ValueError):
@@ -107,6 +107,39 @@ def _find_profile(
     return None
 
 
+def _profile_by_uuid_hint(
+    client: KarnakClient,
+    profile_cfg: dict[str, Any],
+    *,
+    name: str,
+    version: str | None,
+) -> dict[str, Any] | None:
+    """The profile the caller already knows by uuid, without listing the whole store.
+
+    ``GET /api/profiles`` returns every profile with all its elements, which took two
+    minutes on a store of 77 profiles, and a caller that applied the profile a moment
+    ago (a release restoring a baseline) already holds its uuid. The hint is only trusted
+    when Karnak still has that uuid under this name and version; a profile that was
+    deleted, or re-uploaded under a new uuid, falls back to the listing.
+    """
+    hint = str(profile_cfg.get("uuid") or "").strip()
+    if not hint:
+        return None
+    try:
+        item = client.get_profile(hint)
+    except KarnakApiError as exc:
+        if exc.status_code in (400, 404):
+            return None
+        raise
+    if not isinstance(item, dict) or str(item.get("uuid", hint)) != hint:
+        return None
+    if str(item.get("name", "")) != name:
+        return None
+    if version is not None and str(item.get("version", "")) != version:
+        return None
+    return item
+
+
 def _ensure_profile(client: KarnakClient, config: dict[str, Any]) -> dict[str, Any]:
     profile_cfg = _require_object(config, "profile")
     path_raw = profile_cfg.get("path")
@@ -124,7 +157,9 @@ def _ensure_profile(client: KarnakClient, config: dict[str, Any]) -> dict[str, A
 
     force_upload = bool(profile_cfg.get("forceUpload", False))
     if not force_upload:
-        existing = _find_profile(client, name=name, version=version)
+        existing = _profile_by_uuid_hint(client, profile_cfg, name=name, version=version) or _find_profile(
+            client, name=name, version=version
+        )
         if existing:
             return {
                 "uuid": str(existing["uuid"]),

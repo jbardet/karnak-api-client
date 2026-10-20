@@ -25,7 +25,11 @@ Two layers:
 - `karnak_api_client.apply` — `apply_config(client, config)`: idempotent
   desired-state application (profile, project + HMAC secret + profile
   binding, auth configs, forward node, source nodes, destinations,
-  pseudonym import) from a JSON config document.
+  pseudonym import) from a JSON config document. A profile entry may carry
+  `uuid` (since 0.4.0): when the profile is not force-uploaded, the apply asks
+  Karnak for that one profile and uses it if its name and version still match,
+  instead of reading the whole store with `GET /api/profiles` (two minutes with
+  77 profiles). A stale or mismatching uuid falls back to the listing.
 
 ## What changed from the pre-2.0.0 API (this package's own v0.2.x)
 
@@ -51,7 +55,7 @@ Two layers:
 ## Install
 
 ```sh
-pip install "karnak-api-client @ git+https://github.com/jbardet/karnak-api-client.git@v0.3.0"
+pip install "karnak-api-client @ git+https://github.com/jbardet/karnak-api-client.git@v0.4.0"
 ```
 
 ## Usage
