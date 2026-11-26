@@ -188,6 +188,7 @@ class KarnakClient:
         json_body: Any | None = None,
         files: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
         expected: set[int] | None = None,
         timeout_sec: float | None = None,
         _form_retry: bool = False,
@@ -203,6 +204,7 @@ class KarnakClient:
                 json=json_body,
                 files=files,
                 params=params,
+                headers=headers,
                 auth=None if self._use_form else self._basic,
                 allow_redirects=False,
                 timeout=timeout_sec or self.config.timeout_sec,
@@ -224,6 +226,7 @@ class KarnakClient:
                 json_body=json_body,
                 files=files,
                 params=params,
+                headers=headers,
                 expected=expected,
                 timeout_sec=timeout_sec,
                 _form_retry=True,
@@ -238,6 +241,7 @@ class KarnakClient:
                 json_body=json_body,
                 files=files,
                 params=params,
+                headers=headers,
                 expected=expected,
                 timeout_sec=timeout_sec,
                 _form_retry=True,
@@ -288,6 +292,23 @@ class KarnakClient:
     def create_profile(self, body: dict[str, Any]) -> dict[str, Any]:
         """POST /api/profiles — JSON create (ProfileInput: name, version, ...)."""
         return self._request("POST", "/api/profiles", json_body=body, expected={201})
+
+    def download_profile(self, profile_uuid: str) -> str:
+        """GET /api/profiles/{uuid}/download — the profile as YAML text.
+
+        The endpoint only produces ``application/x-yaml`` and answers 406 to the client's usual
+        ``Accept: application/json``, so this asks for YAML explicitly. The YAML is Karnak's own
+        serialisation (what its profile editor shows), in the format ``upload_profile`` accepts.
+        """
+        text = self._request(
+            "GET",
+            f"/api/profiles/{profile_uuid}/download",
+            headers={"Accept": "application/x-yaml"},
+            expected={200},
+        )
+        if not isinstance(text, str):
+            raise KarnakError(f"Karnak did not return YAML for profile {profile_uuid}")
+        return text
 
     def get_profile(self, profile_uuid: str) -> dict[str, Any]:
         return self._request("GET", f"/api/profiles/{profile_uuid}", expected={200})

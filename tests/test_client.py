@@ -230,6 +230,39 @@ def test_upload_profile_posts_to_import_and_survives_form_fallback(tmp_path: Pat
         assert content_type == "application/x-yaml"
 
 
+def test_download_profile_asks_for_yaml_because_json_is_a_406() -> None:
+    yaml_text = "name: P\nversion: '1'\nprofileElements: []\n"
+    client, session = make_client(
+        [FakeResponse(200, yaml_text, headers={"Content-Type": "application/x-yaml"})], auth_mode="basic"
+    )
+
+    assert client.download_profile(PROFILE_UUID) == yaml_text
+
+    call = session.calls[0]
+    assert (call["method"], call["url"]) == ("GET", f"{BASE}/api/profiles/{PROFILE_UUID}/download")
+    assert call["headers"] == {"Accept": "application/x-yaml"}
+
+
+def test_download_profile_keeps_its_accept_header_across_the_form_login_fallback() -> None:
+    client, session = make_client(
+        [
+            login_redirect(),
+            login_ok(),
+            FakeResponse(200, "name: P\n", headers={"Content-Type": "application/x-yaml"}),
+        ]
+    )
+
+    assert client.download_profile(PROFILE_UUID) == "name: P\n"
+    gets = [c for c in session.calls if c["method"] == "GET"]
+    assert [c["headers"] for c in gets] == [{"Accept": "application/x-yaml"}] * 2
+
+
+def test_download_profile_refuses_a_json_answer() -> None:
+    client, _ = make_client([FakeResponse(200, {"oops": 1})], auth_mode="basic")
+    with pytest.raises(KarnakError, match="did not return YAML"):
+        client.download_profile(PROFILE_UUID)
+
+
 def test_create_profile_posts_json_to_bare_profiles_path() -> None:
     client, session = make_client([FakeResponse(201, {"uuid": PROFILE_UUID, "name": "X"})], auth_mode="basic")
     body = {"name": "X", "version": "1.0"}
